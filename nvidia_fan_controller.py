@@ -4,9 +4,74 @@ import re
 import os
 import sys
 import logging
-import subprocess
 from typing import Dict, List, Optional, Tuple
 from contextlib import AbstractContextManager
+import nvidia_smi
+from pynvml import (
+    nvmlDeviceGetSupportedMemoryClocks,
+    nvmlDeviceGetMaxClockInfo,
+    _nvmlGetFunctionPointer,
+    _nvmlCheckReturn,
+    nvmlDeviceGetTemperature,
+    NVML_TEMPERATURE_GPU,
+)
+from ctypes import *
+from ctypes.util import find_library
+
+NV_DEVICE_COUNT = 0
+NV_DEVICE_HANDLES = []
+NV_DEVICE_FAN_COUNT = []
+
+def nv_device_count():
+    return nvidia_smi.nvmlDeviceGetCount()
+
+def nv_device_temperature(idx):
+    handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
+    temp = int(nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU))
+    temp *= 1000
+    return temp
+
+def nvmlDeviceGetFanSpeed_v2(handle, fan):
+    c_speed = c_uint()
+    c_fan = c_uint(fan)
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetFanSpeed_v2")
+    ret = fn(handle, c_fan, byref(c_speed))
+    _nvmlCheckReturn(ret)
+    return c_speed.value
+
+def nvmlDeviceGetNumFans(handle):
+    c_num_fans = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetNumFans")
+    ret = fn(handle, byref(c_num_fans))
+    _nvmlCheckReturn(ret)
+    return c_num_fans.value
+
+def nvmlDeviceGetMinMaxFanSpeed(handle):
+    c_min_speed = c_uint()
+    c_max_speed = c_uint()
+    fn = _nvmlGetFunctionPointer("nvmlDeviceGetMinMaxFanSpeed")
+    ret = fn(handle, byref(c_min_speed), byref(c_max_speed))
+    _nvmlCheckReturn(ret)
+    return (c_min_speed.value, c_max_speed.value)
+
+def nvmlDeviceSetFanSpeed_v2(handle, fan, speed):
+    c_speed = c_uint(speed)
+    c_fan = c_uint(fan)
+    fn = _nvmlGetFunctionPointer("nvmlDeviceSetFanSpeed_v2")
+    ret = fn(handle, c_fan, c_speed)
+    _nvmlCheckReturn(ret)
+    return ret
+
+NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW = 0
+NVML_FAN_POLICY_MANUAL                   = 1
+
+def nvmlDeviceSetFanControlPolicy(handle, fan, policy):
+    c_policy = c_uint(policy)
+    c_fan = c_uint(fan)
+    fn = _nvmlGetFunctionPointer("nvmlDeviceSetFanControlPolicy")
+    ret = fn(handle, c_fan, c_policy)
+    _nvmlCheckReturn(ret)
+    return ret
 
 
 logger = logging.getLogger('nvidia-fan-controller')
@@ -21,8 +86,6 @@ Type=simple
 User={USER}
 Group={USER}
 PIDFile=/run/nvidia-fan-control.pid
-Environment=DISPLAY={DISPLAY}
-Environment=XAUTHORITY={XAUTHORITY}
 ExecStart=/usr/bin/python3 {FILEPATH} --target-temperature {TARGET_TEMPERATURE} --interval-secs {INTERVAL_SECS} --log-level INFO
 Restart=always
 RestartSec=10
@@ -167,12 +230,22 @@ class ManualFanControl(AbstractContextManager):
     """ Context manager that sets manual fan control only for the duration of the context. """
     def __enter__(self):
         logger.debug("enabling manual gpu fan control")
-        run_cmd(['nvidia-settings', '--assign', 'GPUFanControlState=1'])
+        nv_set_all_fans_manual_mode()
 
     def __exit__(self, exc_type, exc_value, traceback):
         logger.debug("disabling manual gpu fan control")
-        run_cmd(['nvidia-settings', '--assign', 'GPUFanControlState=0'])
+        nv_set_all_fans_auto_mode()
 
+
+def nv_set_all_fans_manual_mode():
+    for idx in range(NV_DEVICE_COUNT):
+        for fan in range(NV_DEVICE_FAN_COUNT[idx]):
+            nvmlDeviceSetFanControlPolicy(NV_DEVICE_HANDLES[idx], fan, NVML_FAN_POLICY_MANUAL)
+
+def nv_set_all_fans_auto_mode():
+    for idx in range(NV_DEVICE_COUNT):
+        for fan in range(NV_DEVICE_FAN_COUNT[idx]):
+            nvmlDeviceSetFanControlPolicy(NV_DEVICE_HANDLES[idx], fan, NVML_FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
 
 def run_cmd(cmd: List[str]) -> str:
     logger.debug("Running cmd: %s", ' '.join(cmd))
@@ -195,22 +268,28 @@ def run_cmd(cmd: List[str]) -> str:
 
 
 def get_measurements() -> List[Tuple[int, int, int]]:
-    stdout = run_cmd(['nvidia-smi', '--query-gpu=index,temperature.gpu,fan.speed', '--format=csv,noheader'])
-    measurements = re.findall(r'(\d+), (\d+), (\d+) %', stdout, flags=re.MULTILINE)
-    measurements = [tuple(map(int, values)) for values in measurements]  # parse ints
+#    stdout = run_cmd(['nvidia-smi', '--query-gpu=index,temperature.gpu,fan.speed', '--format=csv,noheader'])
+#    measurements = re.findall(r'(\d+), (\d+), (\d+) %', stdout, flags=re.MULTILINE)
+#    measurements = [tuple(map(int, values)) for values in measurements]  # parse ints
+    measurements = list()
+    for idx in range(NV_DEVICE_COUNT):
+        temperature = nvmlDeviceGetTemperature(NV_DEVICE_HANDLES[idx], NVML_TEMPERATURE_GPU)
+        fan_speed = nvmlDeviceGetFanSpeed_v2(NV_DEVICE_HANDLES[idx], 0)
+        measurements.append((idx, temperature, fan_speed))
+    print(measurements)
     return measurements  # [(index, temperature, fanspeed)]
 
 
 def get_fan_speed(index: int) -> int:
-    fan_speed = run_cmd(['nvidia-settings', '--query', f'[fan-{index:d}]/GPUTargetFanSpeed', '--terse'])
+    fan_speed = nvmlDeviceGetFanSpeed_v2(NV_DEVICE_HANDLES[index], 0)
     logger.debug("Current fan speed setting: [fan-%d]/GPUTargetFanSpeed=%s", index, fan_speed)
     return int(fan_speed)
 
 
 def set_fan_speed(index: int, fan_speed: int) -> None:
-    config = f'[fan-{index:d}]/GPUTargetFanSpeed={fan_speed:d}'
-    logger.info("Setting new fan speed: %s", config)
-    run_cmd(['nvidia-settings', '--assign', config])
+    logger.info("Setting new fan[%d] speed: %s", index, fan_speed)
+    for fan in range(NV_DEVICE_FAN_COUNT[index]):
+        nvmlDeviceSetFanSpeed_v2(NV_DEVICE_HANDLES[index], fan, fan_speed)
 
 
 def create_service_file(target_temperature: int = 60, interval_secs: int = 2) -> None:
@@ -225,13 +304,22 @@ def create_service_file(target_temperature: int = 60, interval_secs: int = 2) ->
     with open(service_filepath, 'w', encoding='utf-8') as f:
         f.write(content)
 
+def nvml_init():
+    global NV_DEVICE_COUNT
+    global NV_DEVICE_HANDLES
+    nvidia_smi.nvmlInit()
+    NV_DEVICE_COUNT = nv_device_count()
+    for idx in range(NV_DEVICE_COUNT):
+        NV_DEVICE_HANDLES.append(nvidia_smi.nvmlDeviceGetHandleByIndex(idx))
+        NV_DEVICE_FAN_COUNT.append(nvmlDeviceGetNumFans(NV_DEVICE_HANDLES[idx]))
+
 
 def main() -> None:
     import argparse
     from time import sleep
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--target-temperature', type=int, default=80, help="target max temperature (Celcius)")
+    parser.add_argument('--target-temperature', type=int, default=60, help="target max temperature (Celcius)")
     parser.add_argument('--interval-secs', type=int, default=2, help="number of seconds between consecutive updates")
     parser.add_argument('--log-level', choices=('DEBUG', 'INFO', 'WARN'), default='INFO', help="verbosity level")
     parser.add_argument('--create-service-file', action='store_true', help="create service file and exit")
@@ -243,19 +331,24 @@ def main() -> None:
         create_service_file(target_temperature=args.target_temperature, interval_secs=args.interval_secs)
         sys.exit()
 
+    nvml_init()
+
     if not get_measurements():
         raise RuntimeError("no gpu detected")
 
     # give each GPU its own controller
-    controllers = {
-        index: PIDController(x_target=args.target_temperature, u_min=10, u_max=100, u_start=max(temp / 0.9, speed), e_total_min=-10)
-        for index, temp, speed in get_measurements()}
+    controllers = {}
+    for index, temp, speed in get_measurements():
+        (min_speed, max_speed) = nvmlDeviceGetMinMaxFanSpeed(NV_DEVICE_HANDLES[index])
+        controller = PIDController(x_target=args.target_temperature, u_min=min_speed, u_max=max_speed, u_start=max(temp / 0.9, speed), e_total_min=-10)
+        controllers[index] = controller
 
     with ManualFanControl():
         while True:
             for index, temp, _ in get_measurements():
                 # new speed proposed by PID-controller
                 controller = controllers[index]
+                print(f"{args.target_temperature} - {temp}")
                 fan_speed = int(round(controller(temp)))
 
                 # only update if change is non-trivial
